@@ -1,0 +1,41 @@
+# Zoom G3X MIDI Controller - Claude Guidelines
+
+## Project Overview
+Python application to modify and control patches on a Zoom G3X guitar effects pedal over USB using MIDI.
+
+## Core Principles
+
+### 1. Simplicity & Minimalism
+- Keep the total number of files to a minimum
+- Avoid unnecessary abstractions and complexity
+- Prefer straightforward, readable code over clever solutions
+- Organize code in a simple, flat structure when possible
+
+### 2. Dependency Management
+- **Prefer standard library** whenever possible
+- Only add external dependencies if they:
+  - Significantly reduce complexity
+  - Are popular and widely maintained
+  - Are readily available via pip
+- Document all dependencies clearly in requirements.txt
+
+### 3. Environment & Execution
+- **Always verify the virtual environment is activated** before running code
+- **Always check dependencies are installed** before executing
+- Use appropriate error messages if environment is not set up correctly
+- Remind user to activate environment if needed
+
+### 4. Communication
+- **Ask clarifying questions** when instructions are unclear or ambiguous
+- Don't make assumptions about MIDI implementation details
+- Confirm understanding of Zoom G3X-specific requirements before implementing
+- Verify approach with user for non-trivial changes
+
+## Pre-execution Checklist
+Before running any Python code:
+1. Check if virtual environment exists and is activated
+2. Verify required packages are installed
+3. Inform user if setup steps are needed
+
+## Project Structure
+Keep it simple - avoid over-engineering the file structure.
