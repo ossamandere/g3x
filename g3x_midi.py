@@ -73,6 +73,8 @@ class PatchData:
     patch_name: str = ""
     effect_slots: List[EffectSlot] = field(default_factory=list)
     metadata: bytes = b''
+    decoded_data: bytes = b''  # Overflow-decoded payload
+    _name_offset: int = -1  # Offset where name was found in decoded data
 
     def __str__(self) -> str:
         return f"Patch: {self.patch_name}"
@@ -95,9 +97,90 @@ def decode_14bit(low: int, high: int) -> int:
     return (low & 0x7F) | ((high & 0x7F) << 7)
 
 
+def decode_overflow_bytes(data: List[int]) -> List[int]:
+    """
+    Decode Zoom's 7-bit overflow byte encoding into full 8-bit values.
+
+    MIDI SysEx limits data bytes to 7 bits (0-127). Zoom packs the MSB (bit 7)
+    of every 7 consecutive bytes into a preceding "overflow" byte.
+
+    Structure: [overflow] [b0] [b1] [b2] [b3] [b4] [b5] [b6]
+    - overflow bit 0 -> b0's bit 7
+    - overflow bit 1 -> b1's bit 7
+    - overflow bit 2 -> b2's bit 7
+    - etc.
+
+    Args:
+        data: Raw 7-bit encoded bytes
+
+    Returns:
+        Decoded 8-bit values (will be shorter than input since overflow bytes are consumed)
+    """
+    result = []
+    i = 0
+
+    while i < len(data):
+        # First byte is the overflow byte containing MSBs for next 7 bytes
+        overflow = data[i]
+        i += 1
+
+        # Process up to 7 following bytes
+        for bit_pos in range(7):
+            if i >= len(data):
+                break
+
+            byte_val = data[i]
+            # Extract the MSB from overflow byte and combine with the 7-bit value
+            msb = (overflow >> bit_pos) & 0x01
+            full_byte = byte_val | (msb << 7)
+            result.append(full_byte)
+            i += 1
+
+    return result
+
+
+def encode_overflow_bytes(data: List[int]) -> List[int]:
+    """
+    Encode 8-bit values into Zoom's 7-bit overflow byte format.
+
+    This is the inverse of decode_overflow_bytes().
+
+    Args:
+        data: Full 8-bit values
+
+    Returns:
+        Encoded 7-bit values with overflow bytes inserted
+    """
+    result = []
+    i = 0
+
+    while i < len(data):
+        # Take up to 7 bytes
+        chunk = data[i:i + 7]
+
+        # Build overflow byte from MSBs
+        overflow = 0
+        for bit_pos, byte_val in enumerate(chunk):
+            if byte_val & 0x80:  # If MSB is set
+                overflow |= (1 << bit_pos)
+
+        result.append(overflow)
+
+        # Add the 7-bit portions
+        for byte_val in chunk:
+            result.append(byte_val & 0x7F)
+
+        i += 7
+
+    return result
+
+
 def parse_patch_data(data: List[int]) -> Optional[PatchData]:
     """
     Parse raw SysEx patch data into a structured PatchData object.
+
+    The patch data uses Zoom's 7-bit overflow encoding where every 8th byte
+    contains the MSBs of the following 7 bytes.
 
     Args:
         data: Raw bytes from patch data response (without F0/F7)
@@ -122,103 +205,96 @@ def parse_patch_data(data: List[int]) -> Optional[PatchData]:
     raw_bytes = bytes(data)
     patch = PatchData(raw_data=raw_bytes)
 
-    # Store metadata (bytes 4-7)
-    patch.metadata = raw_bytes[4:8]
+    # Decode the payload (everything after the 4-byte header) using overflow encoding
+    payload = data[4:]
+    decoded = decode_overflow_bytes(payload)
 
-    # Parse patch name (bytes 97-106, null-terminated)
-    if len(data) > PATCH_NAME_OFFSET + PATCH_NAME_LENGTH:
-        name_bytes = data[PATCH_NAME_OFFSET:PATCH_NAME_OFFSET + PATCH_NAME_LENGTH]
-        # Decode as ASCII, stop at null terminator
-        name_chars = []
-        for b in name_bytes:
-            if b == 0:
+    # Store decoded data for debugging
+    patch.decoded_data = bytes(decoded)
+
+    # Parse patch name - in MS70-CDR it's at 0x84-0x8F in decoded data
+    # For G3X with 108 raw bytes -> ~91 decoded bytes, name is likely near the end
+    # Let's search for ASCII text in the decoded data
+    patch.patch_name = ""
+    for start in range(len(decoded) - 4):
+        # Look for a run of printable ASCII
+        if all(32 <= decoded[start + i] < 127 or decoded[start + i] == 0
+               for i in range(min(10, len(decoded) - start))):
+            name_chars = []
+            for i in range(min(12, len(decoded) - start)):
+                b = decoded[start + i]
+                if b == 0:
+                    break
+                if 32 <= b < 127:
+                    name_chars.append(chr(b))
+            if len(name_chars) >= 3:  # Found a name
+                patch.patch_name = ''.join(name_chars).strip()
+                patch._name_offset = start
                 break
-            if 32 <= b < 127:  # Printable ASCII
-                name_chars.append(chr(b))
-        patch.patch_name = ''.join(name_chars).strip()
 
-    # Parse effect slots
-    # Knob 2 positions (confirmed from reverse engineering):
-    # Slot 0: byte 8
-    # Slot 1: bytes 22-23 (14-bit)
-    # Slot 2: bytes 35-36 (14-bit)
-    # Slot 3: byte 50
-    # Slot 4: byte 64
-    # Slot 5: byte 78 (predicted)
+    # Parse effect slots from decoded data
+    # Each slot is 12 bytes. On/off status is bit 0 of first byte.
+    # Slot offsets in decoded data: 0, 12, 24, 36, 48, 60
 
-    knob2_positions = [8, 22, 35, 50, 64, 78]
-
+    SLOT_SIZE = 12
     for slot_num in range(NUM_EFFECT_SLOTS):
         slot = EffectSlot(slot_num=slot_num)
 
-        # Calculate slot byte range (approximate, ~14 bytes per slot starting around byte 5)
-        slot_start = 5 + (slot_num * EFFECT_SLOT_SIZE)
-        slot_end = slot_start + EFFECT_SLOT_SIZE
+        slot_start = slot_num * SLOT_SIZE
+        slot_end = slot_start + SLOT_SIZE
 
-        if slot_end <= len(data):
-            slot.raw_bytes = raw_bytes[slot_start:slot_end]
+        if slot_end <= len(decoded):
+            slot.raw_bytes = bytes(decoded[slot_start:slot_end])
 
-            # Effect ID is typically in first few bytes of slot
-            # Based on structure, byte 0 of slot often has effect type info
-            if slot_start + 2 <= len(data):
-                # Effect ID encoding varies - this is approximate
-                slot.effect_id = data[slot_start] & 0x7F
+            # On/off status: bit 0 of first byte in slot
+            slot.enabled = bool(decoded[slot_start] & 0x01)
 
-            # Enabled/disabled flag (often in slot header)
-            if slot_start + 1 <= len(data):
-                # Enable flag position varies by effect
-                slot.enabled = bool(data[slot_start + 1] & 0x01)
-
-        # Parse knob 2 value at known position
-        k2_pos = knob2_positions[slot_num]
-        if k2_pos + 1 < len(data):
-            # Slots 1 and 2 use 14-bit encoding
-            if slot_num in [1, 2]:
-                slot.knob_values[1] = decode_14bit(data[k2_pos], data[k2_pos + 1])
-            else:
-                slot.knob_values[1] = data[k2_pos]
+            # Effect ID: still needs investigation, but store first byte (minus enable bit)
+            # for reference
+            slot.effect_id = decoded[slot_start] & 0xFE  # Mask off the enable bit
 
         patch.effect_slots.append(slot)
 
     return patch
 
 
-def print_patch_info(patch: PatchData):
+def print_patch_info(patch: PatchData, verbose: bool = False):
     """
     Print human-readable patch information.
 
     Args:
         patch: Parsed PatchData object
+        verbose: If True, show full hex dump
     """
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 60)
     print(f"PATCH: {patch.patch_name or '(unnamed)'}")
-    print("=" * 50)
-
-    print(f"\nMetadata: {' '.join(f'{b:02X}' for b in patch.metadata)}")
-    print(f"Total bytes: {len(patch.raw_data)}")
+    print("=" * 60)
 
     print("\nEFFECT SLOTS:")
-    print("-" * 50)
+    print("-" * 60)
 
     for slot in patch.effect_slots:
         status = "ON " if slot.enabled else "OFF"
-        knob2_val = slot.knob_values[1]
+        # First byte (with enable bit masked) might indicate effect category
+        first_byte = slot.raw_bytes[0] if slot.raw_bytes else 0
+        print(f"  Slot {slot.slot_num}: [{status}]  (byte0=0x{first_byte:02X})")
 
-        print(f"  Slot {slot.slot_num}: [{status}] {slot.effect_name:20s} | Knob2: {knob2_val:4d}")
+    print("-" * 60)
 
-        # Show raw bytes for debugging
-        if slot.raw_bytes:
-            raw_hex = ' '.join(f'{b:02X}' for b in slot.raw_bytes[:8])
-            print(f"           Raw: {raw_hex}...")
+    if verbose:
+        print(f"\nRaw bytes: {len(patch.raw_data)}, Decoded bytes: {len(patch.decoded_data)}")
 
-    print("-" * 50)
+        # Show full decoded data in rows of 16 for analysis
+        print("\nDECODED DATA (hex dump):")
+        print("-" * 60)
+        decoded = patch.decoded_data
+        for row_start in range(0, len(decoded), 16):
+            row = decoded[row_start:row_start + 16]
+            hex_part = ' '.join(f'{b:02X}' for b in row)
+            ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in row)
+            print(f"  {row_start:04X}: {hex_part:<48s} |{ascii_part}|")
 
-    # Show patch name bytes for debugging
-    if len(patch.raw_data) > PATCH_NAME_OFFSET:
-        name_bytes = patch.raw_data[PATCH_NAME_OFFSET:PATCH_NAME_OFFSET + PATCH_NAME_LENGTH]
-        print(f"\nName bytes (@{PATCH_NAME_OFFSET}): {' '.join(f'{b:02X}' for b in name_bytes)}")
-        print(f"  ASCII: {''.join(chr(b) if 32 <= b < 127 else '.' for b in name_bytes)}")
-
+        print("-" * 60)
 
 class ZoomG3X:
     """Interface for the Zoom G3X multi-effects pedal."""
@@ -461,8 +537,9 @@ def interactive_mode(g3x: ZoomG3X):
     print("  normal    - Exit edit mode")
     print("  patch N   - Switch to patch N (0-99)")
     print("  data      - Get current patch data (raw)")
-    print("  info      - Get and parse current patch (parsed view)")
-    print("  parse     - Parse last received patch data")
+    print("  info      - Get and parse current patch (shows on/off status)")
+    print("  info -v   - Verbose info with hex dump")
+    print("  dump      - Show raw vs decoded hex comparison")
     print("  prog      - Get current program number")
     print("  on N      - Turn on effect in slot N (0-5)")
     print("  off N     - Turn off effect in slot N (0-5)")
@@ -491,19 +568,43 @@ def interactive_mode(g3x: ZoomG3X):
                     g3x._last_patch_data = response
                     print(f"Received {len(response)} bytes (use 'parse' to decode)")
             elif cmd[0] == 'info':
+                verbose = len(cmd) > 1 and cmd[1] == '-v'
                 patch = g3x.get_patch_info()
                 if patch:
                     g3x._last_patch_data = list(patch.raw_data)
-                    print_patch_info(patch)
+                    g3x._last_patch = patch
+                    print_patch_info(patch, verbose=verbose)
                 else:
                     print("Failed to get patch info (are you in edit mode?)")
-            elif cmd[0] == 'parse':
-                if hasattr(g3x, '_last_patch_data') and g3x._last_patch_data:
-                    patch = parse_patch_data(g3x._last_patch_data)
-                    if patch:
-                        print_patch_info(patch)
+            elif cmd[0] == 'dump':
+                if hasattr(g3x, '_last_patch') and g3x._last_patch:
+                    patch = g3x._last_patch
+                    raw_payload = list(patch.raw_data)[4:]  # Skip header
+                    decoded = list(patch.decoded_data)
+
+                    print(f"\nPatch: {patch.patch_name}")
+                    print(f"Raw payload: {len(raw_payload)} bytes")
+                    print(f"Decoded: {len(decoded)} bytes")
+
+                    print("\n" + "=" * 70)
+                    print("RAW PAYLOAD:")
+                    print("-" * 70)
+                    for row_start in range(0, len(raw_payload), 16):
+                        row = raw_payload[row_start:row_start + 16]
+                        hex_part = ' '.join(f'{b:02X}' for b in row)
+                        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in row)
+                        print(f"  {row_start:04X}: {hex_part:<48s} |{ascii_part}|")
+
+                    print("\n" + "=" * 70)
+                    print("DECODED DATA:")
+                    print("-" * 70)
+                    for row_start in range(0, len(decoded), 16):
+                        row = decoded[row_start:row_start + 16]
+                        hex_part = ' '.join(f'{b:02X}' for b in row)
+                        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in row)
+                        print(f"  {row_start:04X}: {hex_part:<48s} |{ascii_part}|")
                 else:
-                    print("No patch data cached. Run 'data' or 'info' first.")
+                    print("No patch data cached. Run 'info' first.")
             elif cmd[0] == 'prog':
                 g3x.get_current_program()
             elif cmd[0] == 'on' and len(cmd) > 1:
